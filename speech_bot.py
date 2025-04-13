@@ -8,10 +8,6 @@ from dotenv import load_dotenv
 import os
 import tkinter as tk
 from tkinter import ttk, scrolledtext
-import pyaudio
-import wave
-import numpy as np
-import ctypes
 import sys
 
 class SpeechBot:
@@ -84,14 +80,11 @@ class SpeechBot:
         # Lock for thread synchronization
         self.speech_lock = threading.Lock()
         
-        # Audio engine for interruption
-        self.audio = pyaudio.PyAudio()
+        # Thread for non-blocking speech
+        self.speech_thread = None
         
         # Initialize GUI
         self.init_gui()
-        
-        # Thread for non-blocking speech
-        self.speech_thread = None
         
     def init_gui(self):
         """Initialize the graphical user interface"""
@@ -360,18 +353,32 @@ class SpeechBot:
                 interrupt_thread.daemon = True
                 interrupt_thread.start()
                 
-                # Start speech in a separate thread to allow for interruption
-                self.speech_thread = threading.Thread(target=self._speak_thread, args=(text,))
-                self.speech_thread.daemon = True
-                self.speech_thread.start()
-                
-                # Wait for the speech thread to complete or be interrupted
-                while self.speech_thread.is_alive() and not self.should_stop:
-                    time.sleep(0.1)
-                
-                # If interrupted, stop the speech
-                if self.should_stop:
-                    self.stop_speech()
+                # Create a new engine instance for each speech
+                try:
+                    # Create a new engine instance
+                    engine = pyttsx3.init()
+                    
+                    # Set voice
+                    voices = engine.getProperty('voices')
+                    if voices:
+                        engine.setProperty('voice', voices[1].id)  # Use female voice
+                    
+                    # Set speech rate
+                    engine.setProperty('rate', 150)
+                    
+                    # Speak the text
+                    engine.say(text)
+                    engine.runAndWait()
+                    
+                except Exception as e:
+                    print(f"Error in speech engine: {e}")
+                    # Try one more time with a new engine
+                    try:
+                        engine = pyttsx3.init()
+                        engine.say(text)
+                        engine.runAndWait()
+                    except:
+                        print("Failed to speak after retry")
                 
                 # Stop the interruption thread
                 self.should_stop = True
@@ -385,33 +392,6 @@ class SpeechBot:
                 self.should_stop = True
                 self.status_label.config(text="Error")
     
-    def _speak_thread(self, text):
-        """Thread function for speaking text"""
-        try:
-            # Create a new engine instance
-            engine = pyttsx3.init()
-            
-            # Set voice
-            voices = engine.getProperty('voices')
-            if voices:
-                engine.setProperty('voice', voices[1].id)  # Use female voice
-            
-            # Set speech rate
-            engine.setProperty('rate', 150)
-            
-            # Speak the text
-            engine.say(text)
-            engine.runAndWait()
-        except Exception as e:
-            print(f"Error in speech thread: {e}")
-            # Try one more time
-            try:
-                engine = pyttsx3.init()
-                engine.say(text)
-                engine.runAndWait()
-            except:
-                print("Failed to speak after retry")
-    
     def stop_speech(self):
         """Stop the current speech"""
         try:
@@ -424,6 +404,7 @@ class SpeechBot:
                 # Raise an exception in the thread
                 if sys.platform == 'win32':
                     # Windows-specific code to terminate the thread
+                    import ctypes
                     ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_long(thread_id), ctypes.py_object(SystemExit))
                 else:
                     # For other platforms, we can't directly stop the thread
