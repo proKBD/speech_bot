@@ -74,6 +74,12 @@ class SpeechBot:
         self.is_speaking = False
         self.should_stop = False
         
+        # Create an event for signaling speech to stop
+        self.stop_event = threading.Event()
+        
+        # Store reference to current speech engine
+        self.current_engine = None
+        
         # Conversation history
         self.conversation_history = []
         
@@ -348,6 +354,9 @@ class SpeechBot:
                 self.should_stop = False
                 self.status_label.config(text="Speaking...")
                 
+                # Create a new event for signaling when speech should stop
+                self.stop_event = threading.Event()
+                
                 # Start a thread to listen for interruptions while speaking
                 interrupt_thread = threading.Thread(target=self.listen_for_interruptions)
                 interrupt_thread.daemon = True
@@ -358,6 +367,9 @@ class SpeechBot:
                     # Create a new engine instance
                     engine = pyttsx3.init()
                     
+                    # Store the engine reference so it can be stopped
+                    self.current_engine = engine
+                    
                     # Set voice
                     voices = engine.getProperty('voices')
                     if voices:
@@ -366,9 +378,22 @@ class SpeechBot:
                     # Set speech rate
                     engine.setProperty('rate', 150)
                     
-                    # Speak the text
-                    engine.say(text)
-                    engine.runAndWait()
+                    # Split text into smaller chunks for better interruption handling
+                    sentences = [s.strip() for s in text.split('.') if s.strip()]
+                    
+                    # If no sentences were found, just use the original text
+                    if not sentences:
+                        sentences = [text]
+                    
+                    # Speak each sentence, checking for interruption between sentences
+                    for sentence in sentences:
+                        if self.should_stop or self.stop_event.is_set():
+                            print("Speech interrupted between sentences")
+                            break
+                            
+                        # Speak the sentence
+                        engine.say(sentence + '.')
+                        engine.runAndWait()
                     
                 except Exception as e:
                     print(f"Error in speech engine: {e}")
@@ -379,9 +404,13 @@ class SpeechBot:
                         engine.runAndWait()
                     except:
                         print("Failed to speak after retry")
+                finally:
+                    # Clean up engine reference
+                    self.current_engine = None
                 
                 # Stop the interruption thread
                 self.should_stop = True
+                self.stop_event.set()
                 self.is_speaking = False
                 
                 print("Ready for next input...")
@@ -390,14 +419,32 @@ class SpeechBot:
                 print(f"Error in speak(): {e}")
                 self.is_speaking = False
                 self.should_stop = True
+                if hasattr(self, 'stop_event'):
+                    self.stop_event.set()
                 self.status_label.config(text="Error")
     
     def stop_speech(self):
         """Stop the current speech"""
         try:
-            # This is a workaround to stop pyttsx3 speech
-            # It works by raising an exception in the speech thread
-            if self.speech_thread and self.speech_thread.is_alive():
+            print("Attempting to stop speech")
+            
+            # Set flags to stop speech
+            self.should_stop = True
+            if hasattr(self, 'stop_event'):
+                self.stop_event.set()
+            
+            # If we have a reference to the current engine, try to stop it
+            if hasattr(self, 'current_engine') and self.current_engine:
+                try:
+                    # This is a workaround since pyttsx3 doesn't have a direct stop method
+                    # We'll disconnect the engine from its driver to force it to stop
+                    self.current_engine.disconnect()
+                    print("Disconnected speech engine")
+                except:
+                    print("Failed to disconnect speech engine")
+                    
+            # If we have a speech thread, try to terminate it
+            if hasattr(self, 'speech_thread') and self.speech_thread and self.speech_thread.is_alive():
                 # Get the thread ID
                 thread_id = self.speech_thread.ident
                 
@@ -406,24 +453,24 @@ class SpeechBot:
                     # Windows-specific code to terminate the thread
                     import ctypes
                     ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_long(thread_id), ctypes.py_object(SystemExit))
-                else:
-                    # For other platforms, we can't directly stop the thread
-                    # We'll just set the flag and hope the thread checks it
-                    self.should_stop = True
+                    print("Sent termination signal to speech thread")
                 
-                # Wait for the thread to terminate
-                self.speech_thread.join(timeout=1.0)
+                # Wait briefly for thread to terminate
+                self.speech_thread.join(timeout=0.5)
                 
-                # If the thread is still alive, we'll just continue
-                if self.speech_thread.is_alive():
-                    print("Could not stop speech thread, continuing anyway")
+            print("Speech stopped")
         except Exception as e:
             print(f"Error stopping speech: {e}")
 
     def listen_for_interruptions(self):
         """Listen for user interruptions while the bot is speaking"""
-        while self.is_speaking and not self.should_stop and self.running:
-            try:
+        try:
+            # Continue until speech is done or interrupted
+            while self.is_speaking and not self.should_stop and self.running:
+                # Check if stop event is set
+                if hasattr(self, 'stop_event') and self.stop_event.is_set():
+                    break
+                    
                 # Listen for interruption
                 interruption = self.listen(interrupt_mode=True)
                 if interruption:
@@ -432,15 +479,20 @@ class SpeechBot:
                     
                     # Set flags to stop the current speech
                     self.should_stop = True
+                    if hasattr(self, 'stop_event'):
+                        self.stop_event.set()
                     
                     # Stop the current speech
+                    self.stop_speech()
+                    
+                    # Wait a moment to ensure the previous speech is fully stopped
+                    time.sleep(0.3)
+                    
+                    # Process the interruption
                     with self.speech_lock:
                         try:
-                            # Process the interruption
+                            # Get response to the interruption
                             response = self.get_llm_response(interruption)
-                            
-                            # Wait a moment to ensure the previous speech is fully stopped
-                            time.sleep(0.5)
                             
                             # Reset flags
                             self.is_speaking = False
@@ -449,6 +501,8 @@ class SpeechBot:
                             if response:
                                 print(f"Speaking interruption response: {response}")
                                 self.output_queue.put(f"Bot: {response}")
+                                
+                                # Create a separate engine for interruption response
                                 try:
                                     # Create a new engine instance for the response
                                     engine = pyttsx3.init()
@@ -470,9 +524,12 @@ class SpeechBot:
                         except Exception as e:
                             print(f"Error handling interruption: {e}")
                     break
-            except Exception as e:
-                print(f"Error in interruption handling: {e}")
-                time.sleep(0.1)
+            
+        except Exception as e:
+            print(f"Error in interruption handling: {e}")
+            time.sleep(0.1)
+        finally:
+            print("Interruption listener thread ending")
 
     def run(self):
         """Main conversation loop"""
